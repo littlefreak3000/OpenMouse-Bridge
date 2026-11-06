@@ -21,6 +21,10 @@ use crate::{
     platform,
 };
 
+mod reassert;
+
+pub use reassert::{DeviceStateStatus, ReplayRecord, Trigger};
+
 fn normalized_name(value: &str) -> String {
     value
         .chars()
@@ -471,6 +475,8 @@ pub struct BridgeService {
     native_automation: Arc<std::sync::Mutex<crate::drivers::automation::NativeAutomation>>,
     // Set while a battery poll runs, so two never overlap.
     battery_polling: Arc<AtomicBool>,
+    // The stored device state and the triggers that replay it.
+    reassert: Arc<reassert::Reassert>,
 }
 
 /// A control panel is connected when it holds a HID WebSocket session or
@@ -726,6 +732,7 @@ impl BridgeService {
             buttons: Arc::default(),
             native_automation: Arc::default(),
             battery_polling: Arc::default(),
+            reassert: Arc::default(),
         }
     }
 
@@ -1356,6 +1363,7 @@ impl BridgeService {
                     state.detected = Some(detected);
                 }
                 if appeared {
+                    service.request_reassert(Trigger::DeviceArrived);
                     tokio::spawn(poll_batteries(service.clone()));
                 }
                 previous = Some(ids);

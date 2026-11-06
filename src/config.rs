@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_BATTERY_THRESHOLD: u8 = 20;
 const DEFAULT_ALERT_COOLDOWN_MINUTES: u64 = 360;
 const DEFAULT_NOTIFICATION_VOLUME: u8 = 60;
+const DEFAULT_REASSERT_INTERVAL_SECONDS: u64 = 300;
+const DEFAULT_VERIFY_INTERVAL_SECONDS: u64 = 60;
+const MIN_VERIFY_INTERVAL_SECONDS: u64 = 15;
+/// A watchdog faster than this would keep the device bus and the Node helper busy for nothing.
+const MIN_REASSERT_INTERVAL_SECONDS: u64 = 30;
 const OFFICIAL_ORIGINS: &[&str] = &[
     "https://control.openmouse.app",
     "https://dev.openmouse.app",
@@ -51,6 +56,28 @@ pub struct BridgeConfig {
     pub profiles: Vec<ApplicationProfile>,
     #[serde(default)]
     pub default_profile: Option<ApplicationProfile>,
+    /// The last state the control panel set on each device (lighting, mainly),
+    /// which Bridge replays whenever it could have been lost: at startup, when
+    /// the device reappears, on resume, and on session lock, unlock, logon and
+    /// logoff. Lives apart from profiles because it applies all the time, not
+    /// per game.
+    #[serde(default)]
+    pub device_states: Vec<DeviceState>,
+    /// How often, in seconds, replayable state is re-sent as a watchdog; 0
+    /// turns the watchdog off (events still replay). Animated lighting is never
+    /// replayed by the watchdog, since re-sending an effect restarts it.
+    #[serde(default = "default_reassert_interval")]
+    pub reassert_interval_seconds: u64,
+    /// How often, in seconds, Bridge reads back the effect a device that can
+    /// report it is running and rewrites it only if it differs from the stored
+    /// state; 0 turns that off. Reading never interrupts vendor software the way
+    /// a write does, so this can be much faster than the blind watchdog, and
+    /// devices it covers are left out of the watchdog.
+    #[serde(default = "default_verify_interval")]
+    pub verify_interval_seconds: u64,
+    /// How lighting is managed and when it is turned off; see [`LightingSettings`].
+    #[serde(default)]
+    pub lighting: LightingSettings,
     #[serde(default = "default_origins")]
     pub allowed_origins: Vec<String>,
     /// Whether Bridge has already turned launch-at-login on by default, so a
@@ -174,6 +201,81 @@ pub struct ProfileDevice {
     pub name: String,
 }
 
+/// Who sets the colours.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LightingMode {
+    /// Vendor software (Razer Synapse) sets the colours, and Bridge holds the
+    /// same colour as the fallback the device shows when that software stops
+    /// feeding it, repairing it if something resets it. Vendor software's own
+    /// colours cannot be read back, so the colour is told to Bridge, not learned.
+    #[default]
+    Maintain,
+    /// Bridge is the colour client and vendor software is not running.
+    Own,
+}
+
+/// Lighting behaviour for every device Bridge keeps a state for.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LightingSettings {
+    #[serde(default)]
+    pub mode: LightingMode,
+    /// Turn the lights off while the monitor is off and bring the stored colours
+    /// back when it comes on. The stored state is never changed by this.
+    #[serde(default)]
+    pub off_when_display_off: bool,
+    /// Turn the lights off as the PC goes to sleep and bring them back on resume.
+    #[serde(default)]
+    pub off_on_sleep: bool,
+}
+
+/// The most devices whose state Bridge keeps.
+pub const MAX_DEVICE_STATES: usize = 32;
+/// The largest serialized snapshot kept per device, in bytes.
+pub const MAX_DEVICE_STATE_BYTES: usize = 64 * 1024;
+
+/// What the control panel last set on one device, as its `Partial<MouseStatus>`
+/// field map, keyed by the same `"<brand>:<name>"` id profiles use.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceState {
+    pub device_id: String,
+    pub device_name: String,
+    pub snapshot: serde_json::Map<String, serde_json::Value>,
+    /// Unix seconds of the last change.
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+impl DeviceState {
+    /// The brand half of the device id, as the drivers dispatch on it.
+    pub fn brand(&self) -> &str {
+        self.device_id.split(':').next().unwrap_or_default()
+    }
+
+    /// Whether re-sending this state is invisible. A static or off effect looks
+    /// the same however often it is written; an animated one (cycling, wave,
+    /// breathing, reactive) restarts, so only events replay it, never the
+    /// watchdog. State with no lighting at all is replayable.
+    pub fn is_idempotent(&self) -> bool {
+        let zones = self
+            .snapshot
+            .get("lightingZones")
+            .or_else(|| self.snapshot.get("lighting"));
+        let animated = |zone: &serde_json::Value| {
+            zone.get("mode")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|mode| !matches!(mode.to_ascii_lowercase().as_str(), "static" | "off"))
+        };
+        match zones {
+            Some(serde_json::Value::Array(zones)) => !zones.iter().any(animated),
+            Some(zone @ serde_json::Value::Object(_)) => !animated(zone),
+            _ => true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileSettings {
@@ -202,6 +304,10 @@ impl Default for BridgeConfig {
             local_applications: Vec::new(),
             profiles: Vec::new(),
             default_profile: None,
+            device_states: Vec::new(),
+            reassert_interval_seconds: DEFAULT_REASSERT_INTERVAL_SECONDS,
+            verify_interval_seconds: DEFAULT_VERIFY_INTERVAL_SECONDS,
+            lighting: LightingSettings::default(),
             allowed_origins: default_origins(),
             autostart_configured: false,
             tray_hint_shown: false,
@@ -257,6 +363,27 @@ impl BridgeConfig {
                 self.default_profile = None;
             }
         }
+        if self.reassert_interval_seconds != 0 {
+            self.reassert_interval_seconds = self
+                .reassert_interval_seconds
+                .max(MIN_REASSERT_INTERVAL_SECONDS);
+        }
+        if self.verify_interval_seconds != 0 {
+            self.verify_interval_seconds = self
+                .verify_interval_seconds
+                .max(MIN_VERIFY_INTERVAL_SECONDS);
+        }
+        for state in &mut self.device_states {
+            state.device_id = state.device_id.trim().to_owned();
+            state.device_name = state.device_name.trim().to_owned();
+        }
+        let mut seen_states = std::collections::HashSet::new();
+        self.device_states.retain(|state| {
+            !state.device_id.is_empty()
+                && !state.snapshot.is_empty()
+                && seen_states.insert(state.device_id.to_ascii_lowercase())
+        });
+        self.device_states.truncate(MAX_DEVICE_STATES);
         for origin in OFFICIAL_ORIGINS {
             if !self.allowed_origins.iter().any(|entry| entry == origin) {
                 self.allowed_origins.push((*origin).to_owned());
@@ -449,6 +576,14 @@ const fn default_notification_volume() -> u8 {
     DEFAULT_NOTIFICATION_VOLUME
 }
 
+const fn default_reassert_interval() -> u64 {
+    DEFAULT_REASSERT_INTERVAL_SECONDS
+}
+
+const fn default_verify_interval() -> u64 {
+    DEFAULT_VERIFY_INTERVAL_SECONDS
+}
+
 fn default_tray_battery_style() -> String {
     "glyph".to_owned()
 }
@@ -615,6 +750,10 @@ mod tests {
             hybrid_mode: true,
             profiles: Vec::new(),
             default_profile: None,
+            device_states: Vec::new(),
+            reassert_interval_seconds: DEFAULT_REASSERT_INTERVAL_SECONDS,
+            verify_interval_seconds: DEFAULT_VERIFY_INTERVAL_SECONDS,
+            lighting: LightingSettings::default(),
             allowed_origins: Vec::new(),
             local_applications: Vec::new(),
             autostart_configured: false,
@@ -661,6 +800,120 @@ mod tests {
             .collect();
         assert_eq!(names, ["Valorant", "My Game"]);
         assert_eq!(config.custom_games[0].executables, ["mygame.exe"]);
+    }
+
+    fn device_state(id: &str, snapshot: serde_json::Value) -> DeviceState {
+        DeviceState {
+            device_id: id.into(),
+            device_name: "Mouse".into(),
+            snapshot: snapshot.as_object().cloned().expect("an object"),
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn only_static_or_off_lighting_is_safe_for_the_watchdog() {
+        let zone = |mode: &str| serde_json::json!({ "zone": "Logo", "mode": mode });
+        let idempotent = |snapshot| device_state("Razer:Mouse", snapshot).is_idempotent();
+        assert!(idempotent(
+            serde_json::json!({ "lighting": zone("Static") })
+        ));
+        assert!(idempotent(serde_json::json!({ "lighting": zone("Off") })));
+        assert!(idempotent(
+            serde_json::json!({ "lightingZones": [zone("Static"), zone("off")] })
+        ));
+        assert!(!idempotent(serde_json::json!({ "lighting": zone("Wave") })));
+        assert!(
+            !idempotent(serde_json::json!({ "lightingZones": [zone("Static"), zone("Cycling")] })),
+            "one animated zone is enough to keep the watchdog away"
+        );
+        assert!(
+            idempotent(serde_json::json!({ "lightingZones": [{ "zone": "Logo", "mode": null }] })),
+            "a zone with no effect chosen has nothing to restart"
+        );
+        assert!(
+            idempotent(serde_json::json!({ "dpi": 800 })),
+            "state without lighting is replayable"
+        );
+    }
+
+    #[test]
+    fn device_states_are_deduplicated_capped_and_the_watchdog_has_a_floor() {
+        let mut states: Vec<DeviceState> = (0..MAX_DEVICE_STATES + 5)
+            .map(|i| {
+                device_state(
+                    &format!("Razer:Mouse {i}"),
+                    serde_json::json!({ "dpi": 800 }),
+                )
+            })
+            .collect();
+        states.push(device_state(
+            " razer:mouse 0 ",
+            serde_json::json!({ "dpi": 1600 }),
+        ));
+        states.push(device_state("Razer:Empty", serde_json::json!({})));
+        let config = BridgeConfig {
+            device_states: states,
+            reassert_interval_seconds: 5,
+            ..BridgeConfig::default()
+        }
+        .normalized();
+        assert_eq!(config.device_states.len(), MAX_DEVICE_STATES);
+        assert!(
+            config
+                .device_states
+                .iter()
+                .all(|state| state.device_id != "Razer:Empty")
+        );
+        assert_eq!(
+            config.device_states[0].snapshot["dpi"], 800,
+            "the first entry for a device wins"
+        );
+        assert_eq!(config.reassert_interval_seconds, 30);
+        let off = BridgeConfig {
+            reassert_interval_seconds: 0,
+            ..BridgeConfig::default()
+        }
+        .normalized();
+        assert_eq!(off.reassert_interval_seconds, 0, "zero stays off");
+    }
+
+    #[test]
+    fn configs_saved_before_device_state_load_with_the_defaults() {
+        let config: BridgeConfig = serde_json::from_str("{}").expect("empty config parses");
+        assert!(config.device_states.is_empty());
+        assert_eq!(config.reassert_interval_seconds, 300);
+        assert_eq!(config.verify_interval_seconds, 60);
+    }
+
+    #[test]
+    fn lighting_settings_default_to_maintaining_with_both_power_options_off() {
+        let config: BridgeConfig = serde_json::from_str("{}").expect("empty config parses");
+        assert_eq!(config.lighting.mode, LightingMode::Maintain);
+        assert!(!config.lighting.off_when_display_off && !config.lighting.off_on_sleep);
+        let saved: BridgeConfig =
+            serde_json::from_str(r#"{"lighting":{"mode":"own","offWhenDisplayOff":true}}"#)
+                .expect("a partial lighting block parses");
+        assert_eq!(saved.lighting.mode, LightingMode::Own);
+        assert!(saved.lighting.off_when_display_off);
+        assert!(!saved.lighting.off_on_sleep, "an unset option stays off");
+        assert!(serde_json::from_str::<BridgeConfig>(r#"{"lighting":{"mode":"bogus"}}"#).is_err());
+    }
+
+    #[test]
+    fn the_verify_interval_has_a_floor_and_zero_turns_it_off() {
+        let floor = BridgeConfig {
+            verify_interval_seconds: 3,
+            ..BridgeConfig::default()
+        }
+        .normalized();
+        assert_eq!(floor.verify_interval_seconds, 15);
+        let off = BridgeConfig {
+            verify_interval_seconds: 0,
+            ..BridgeConfig::default()
+        }
+        .normalized();
+        assert_eq!(off.verify_interval_seconds, 0);
     }
 
     #[test]

@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lighting</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f5f7; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b72; --line: #dcdce2;
+    --accent: #2f9e44; --warn-bg: #fff4e0; --warn-line: #e0a030; --bad: #c92a2a; --ok: #2f9e44;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101113; --panel: #1a1b1e; --text: #ececf0; --muted: #9a9aa4; --line: #2c2d33;
+      --accent: #51cf66; --warn-bg: #2b2210; --warn-line: #8a6a1f; --bad: #ff6b6b; --ok: #51cf66;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 32px 0 10px; }
+  p { margin: 0 0 8px; }
+  .muted { color: var(--muted); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .banner { border: 1px solid var(--warn-line); background: var(--warn-bg); border-radius: 10px; padding: 10px 14px; margin: 14px 0 0; }
+  .modes { display: grid; gap: 10px; }
+  label.choice { display: flex; gap: 12px; align-items: flex-start; cursor: pointer; }
+  label.choice input { margin-top: 4px; accent-color: var(--accent); }
+  label.choice strong { display: block; }
+  .devices { display: grid; gap: 12px; }
+  .device h3 { margin: 0; font-size: 16px; }
+  .device .meta { font-size: 13px; color: var(--muted); }
+  .zones { margin: 8px 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  .zone { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-size: 13px; }
+  .swatch { width: 12px; height: 12px; border-radius: 50%; border: 1px solid var(--line); background: conic-gradient(red, yellow, lime, cyan, blue, magenta, red); }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 10px; }
+  input[type=color] { width: 44px; height: 34px; padding: 0; border: 1px solid var(--line); border-radius: 8px; background: none; cursor: pointer; }
+  input[type=text] { width: 96px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; font-family: ui-monospace, Consolas, monospace; }
+  button { font: inherit; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .status { font-size: 13px; min-height: 1.3em; }
+  .status.ok { color: var(--ok); } .status.bad { color: var(--bad); }
+  .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .power { display: grid; gap: 12px; }
+  .hint { font-size: 13px; color: var(--muted); margin-top: 2px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Lighting</h1>
+  <p class="muted">Static colours for your Razer devices, kept through lock, sleep and sign-out by the OpenMouse service.</p>
+  <div id="banner" class="banner" hidden></div>
+
+  <h2>How colours are set</h2>
+  <div class="panel modes" role="radiogroup" aria-label="Lighting mode">
+    <label class="choice">
+      <input type="radio" name="mode" value="maintain">
+      <span><strong>Keep Synapse's colours</strong>
+        Razer Synapse keeps setting your colours. This app remembers a colour for each device and holds it as the fallback the device shows when Synapse stops feeding it (lock, sleep, sign-out), and puts it back if something resets it. Synapse's own colours cannot be read back, so set the <em>same</em> colour here as in Synapse.</span>
+    </label>
+    <label class="choice">
+      <input type="radio" name="mode" value="own">
+      <span><strong>Use this app instead of Synapse</strong>
+        This app is the only thing setting colours. Quit Synapse, or turn its lighting off, so the two do not fight over the lights.</span>
+    </label>
+  </div>
+
+  <h2>Devices</h2>
+  <div class="toolbar">
+    <span id="scan" class="muted">Looking for devices…</span>
+    <button id="rescan" type="button">Rescan</button>
+  </div>
+  <div id="devices" class="devices" aria-live="polite"></div>
+
+  <h2>Power</h2>
+  <div class="panel power">
+    <label class="choice">
+      <input type="checkbox" id="offDisplay">
+      <span><strong>Turn the lights off when the monitor turns off</strong>
+        <span class="hint">They come back, in the same colours, when the monitor comes on.</span></span>
+    </label>
+    <label class="choice">
+      <input type="checkbox" id="offSleep">
+      <span><strong>Turn the lights off when the PC sleeps</strong>
+        <span class="hint">They come back when it wakes. Windows may suspend before every device has been told, so a device can occasionally stay lit.</span></span>
+    </label>
+    <div class="row">
+      <button id="testOff" type="button">Test the monitor setting (lights off for 5 seconds)</button>
+      <span id="powerStatus" class="status" role="status"></span>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let settings = { mode: "maintain", offWhenDisplayOff: false, offOnSleep: false, razerSoftwareRunning: false };
+let devices = [];
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
+  return response.json();
+}
+const send = (path, body) => api(path, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+function setStatus(element, text, kind) {
+  element.textContent = text;
+  element.className = "status" + (kind ? " " + kind : "");
+}
+
+function renderBanner() {
+  const banner = $("banner");
+  const lines = [];
+  if (settings.mode === "own" && settings.razerSoftwareRunning) {
+    lines.push("Razer Synapse is running. It will fight this app for the lights: quit it from its tray icon, or turn its lighting off.");
+  }
+  if (settings.mode === "maintain" && !settings.razerSoftwareRunning) {
+    lines.push("Razer Synapse is not running right now, so the colours below are what your devices show.");
+  }
+  banner.textContent = lines.join(" ");
+  banner.hidden = lines.length === 0;
+}
+
+function renderSettings() {
+  for (const radio of document.querySelectorAll("input[name=mode]")) radio.checked = radio.value === settings.mode;
+  $("offDisplay").checked = settings.offWhenDisplayOff;
+  $("offSleep").checked = settings.offOnSleep;
+  $("testOff").disabled = !settings.offWhenDisplayOff;
+  renderBanner();
+}
+
+async function saveSettings(change) {
+  const next = { ...settings, ...change };
+  try {
+    await send("/v1/lighting/settings", { mode: next.mode, offWhenDisplayOff: next.offWhenDisplayOff, offOnSleep: next.offOnSleep });
+    settings = next;
+    setStatus($("powerStatus"), "Saved.", "ok");
+  } catch (error) {
+    setStatus($("powerStatus"), "Could not save: " + error.message, "bad");
+  }
+  renderSettings();
+}
+
+function zoneChip(zone) {
+  const chip = document.createElement("span");
+  chip.className = "zone";
+  const swatch = document.createElement("span");
+  swatch.className = "swatch";
+  if (zone.mode === "Static" && zone.color) swatch.style.background = zone.color;
+  else if (zone.mode === "Off") swatch.style.background = "transparent";
+  const label = document.createElement("span");
+  const state = zone.mode ? zone.mode + (zone.mode === "Static" && zone.color ? " " + zone.color : "") : "unknown";
+  label.textContent = `${zone.zone}: ${state}`;
+  chip.append(swatch, label);
+  return chip;
+}
+
+function deviceCard(device) {
+  const card = document.createElement("section");
+  card.className = "panel device";
+  const title = document.createElement("h3");
+  title.textContent = device.name;
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = [device.firmware.join(", "), "product " + device.productId.toString(16).padStart(4, "0")].filter(Boolean).join(" · ");
+  card.append(title, meta);
+
+  if (device.zones.length === 0) {
+    const none = document.createElement("p");
+    none.className = "muted";
+    none.textContent = "This device answers but reports no lighting zones, so there is nothing to colour.";
+    card.append(none);
+    return card;
+  }
+
+  const zones = document.createElement("div");
+  zones.className = "zones";
+  for (const zone of device.zones) zones.append(zoneChip(zone));
+  card.append(zones);
+
+  const stored = device.stored && device.stored[0] && device.stored[0].color;
+  const live = device.zones.find((zone) => zone.mode === "Static" && zone.color);
+  const start = stored || (live && live.color) || "#7c5cff";
+
+  const picker = document.createElement("input");
+  picker.type = "color";
+  picker.value = start;
+  picker.setAttribute("aria-label", `Colour for ${device.name}`);
+  const hex = document.createElement("input");
+  hex.type = "text";
+  hex.value = start;
+  hex.maxLength = 7;
+  hex.setAttribute("aria-label", `Hex colour for ${device.name}`);
+  picker.addEventListener("input", () => { hex.value = picker.value; });
+  hex.addEventListener("input", () => { if (/^#[0-9a-fA-F]{6}$/.test(hex.value)) picker.value = hex.value; });
+
+  const apply = document.createElement("button");
+  apply.type = "button";
+  apply.className = "primary";
+  apply.textContent = "Apply colour";
+  const status = document.createElement("span");
+  status.className = "status";
+  status.setAttribute("role", "status");
+  apply.addEventListener("click", async () => {
+    apply.disabled = true;
+    setStatus(status, "Writing…");
+    try {
+      await send("/v1/lighting/colour", { deviceId: device.id, color: hex.value });
+      setStatus(status, "Applied and saved as this device's colour.", "ok");
+    } catch (error) {
+      setStatus(status, error.message, "bad");
+    }
+    apply.disabled = false;
+  });
+
+  const row = document.createElement("div");
+  row.className = "row";
+  row.append(picker, hex, apply, status);
+  card.append(row);
+  if (device.lastReplay && device.lastReplay.outcome === "failed") {
+    const failed = document.createElement("div");
+    failed.className = "status bad";
+    failed.textContent = "Last write failed: " + (device.lastReplay.error || "unknown error");
+    card.append(failed);
+  }
+  return card;
+}
+
+async function scan(refresh) {
+  const list = $("devices");
+  setStatus($("scan"), "Looking for devices…");
+  $("rescan").disabled = true;
+  try {
+    const result = await api("/v1/lighting/devices" + (refresh ? "?refresh=true" : ""));
+    devices = result.devices;
+    settings.razerSoftwareRunning = result.razerSoftwareRunning;
+    list.replaceChildren(...devices.map(deviceCard));
+    setStatus($("scan"), devices.length ? `${devices.length} device${devices.length === 1 ? "" : "s"} found.` : "No lighting devices found. If a wireless mouse is asleep, move it and rescan.");
+  } catch (error) {
+    list.replaceChildren();
+    setStatus($("scan"), "Could not scan: " + error.message, "bad");
+  }
+  $("rescan").disabled = false;
+  renderBanner();
+}
+
+for (const radio of document.querySelectorAll("input[name=mode]")) {
+  radio.addEventListener("change", () => { if (radio.checked) saveSettings({ mode: radio.value }); });
+}
+$("offDisplay").addEventListener("change", (event) => saveSettings({ offWhenDisplayOff: event.target.checked }));
+$("offSleep").addEventListener("change", (event) => saveSettings({ offOnSleep: event.target.checked }));
+$("rescan").addEventListener("click", () => scan(true));
+$("testOff").addEventListener("click", async () => {
+  const status = $("powerStatus");
+  $("testOff").disabled = true;
+  try {
+    await send("/v1/lighting/power", { event: "displayOff" });
+    setStatus(status, "Lights should go off now; they come back in 5 seconds.");
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    await send("/v1/lighting/power", { event: "displayOn" });
+    setStatus(status, "Lights restored.", "ok");
+  } catch (error) {
+    // Never leave the lights off because the test failed half way.
+    try { await send("/v1/lighting/power", { event: "displayOn" }); } catch (_) { /* nothing more to do */ }
+    setStatus(status, "Test failed: " + error.message, "bad");
+  }
+  $("testOff").disabled = !settings.offWhenDisplayOff;
+});
+
+(async () => {
+  try {
+    settings = await api("/v1/lighting/settings");
+  } catch (error) {
+    setStatus($("powerStatus"), "Could not read settings: " + error.message, "bad");
+  }
+  renderSettings();
+  scan(false);
+})();
+</script>
+</body>
+</html>

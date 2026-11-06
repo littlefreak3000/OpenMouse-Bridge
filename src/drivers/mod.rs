@@ -24,7 +24,7 @@ mod lamzu;
 mod native_hid;
 pub mod pulsar;
 
-pub use native_hid::{NativeBattery, NativeStatus, spawn_button_listener};
+pub use native_hid::{ApplyHints, NativeBattery, NativeStatus, spawn_button_listener};
 
 /// A mouse Bridge discovered by itself, by scanning the HID bus for vendor
 /// ids its drivers recognize — no saved profile required.
@@ -229,6 +229,15 @@ fn ensure_native_ownership() -> Result<()> {
 /// driver classes rather than Bridge reimplementing each vendor's protocol
 /// (see `native_hid` and `native-hid/README.md`).
 pub fn apply_profile(profile: &ApplicationProfile) -> Result<bool> {
+    Ok(apply_profile_with_hints(profile, ApplyHints::default())?.0)
+}
+
+/// [`apply_profile`] with what the caller knows about the target device, and the
+/// product id that answered (when the helper reports one) in return.
+pub fn apply_profile_with_hints(
+    profile: &ApplicationProfile,
+    hints: ApplyHints,
+) -> Result<(bool, Option<u16>)> {
     let brand = profile
         .device
         .id
@@ -246,17 +255,84 @@ pub fn apply_profile(profile: &ApplicationProfile) -> Result<bool> {
     match brand.as_str() {
         pulsar::BRAND => {
             pulsar::apply(profile)?;
-            Ok(true)
+            Ok((true, None))
         }
         delux::BRAND => {
             if delux::apply(profile)? {
-                Ok(true)
+                Ok((true, None))
             } else {
-                native_hid::apply(profile)
+                native_hid::apply_with_hints(profile, hints)
             }
         }
-        _ => native_hid::apply(profile),
+        _ => native_hid::apply_with_hints(profile, hints),
     }
+}
+
+/// Replays what the control panel last set on a device: its stored snapshot,
+/// plus DPI and polling rate when the snapshot carries them, go through the
+/// same path as an automatic profile. `Ok((false, _))` means no driver claims the
+/// device. It writes to the named device or to none (never to a lone other
+/// device), and returns the product id that answered so the next replay can try
+/// it first.
+pub fn apply_device_state(
+    state: &crate::config::DeviceState,
+    hint_product_id: Option<u16>,
+) -> Result<(bool, Option<u16>)> {
+    use crate::config::{ProfileApplication, ProfileDevice, ProfileSettings};
+    let number = |field: &str| {
+        state
+            .snapshot
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+    };
+    let hints = ApplyHints {
+        product_id: hint_product_id,
+        exact_device: true,
+    };
+    apply_profile_with_hints(
+        &ApplicationProfile {
+            application: ProfileApplication {
+                name: "Last device state".into(),
+                executable: String::new(),
+                path: String::new(),
+                local_id: None,
+                activation: None,
+                bundle_path: None,
+                bundle_identifier: None,
+            },
+            device: ProfileDevice {
+                id: state.device_id.clone(),
+                name: state.device_name.clone(),
+            },
+            settings: ProfileSettings {
+                dpi: number("dpi"),
+                polling_rate_hz: number("pollingRateHz"),
+                snapshot: Some(serde_json::Value::Object(state.snapshot.clone())),
+            },
+            enabled: true,
+        },
+        hints,
+    )
+}
+
+/// Lists the connected Razer devices and the lighting zones each reports,
+/// serialized with Bridge's other device access.
+pub fn list_device_lighting() -> Result<Vec<serde_json::Value>> {
+    let _access = device_access();
+    ensure_native_ownership()?;
+    native_hid::list_lighting("Razer")
+}
+
+/// Reads the lighting the device named by `device_id` is running right now (see
+/// [`native_hid::read_lighting`]), serialized with Bridge's other device access.
+pub fn read_device_lighting(
+    device_id: &str,
+    hint_product_id: Option<u16>,
+) -> Result<(Vec<serde_json::Value>, Option<u16>)> {
+    let _access = device_access();
+    ensure_native_ownership()?;
+    native_hid::read_lighting(device_id, hint_product_id)
 }
 
 pub(crate) fn reconcile_automatic(

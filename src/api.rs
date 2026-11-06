@@ -46,6 +46,50 @@ struct LocalApplicationsPayload {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct DeviceStatePayload {
+    device_id: String,
+    #[serde(default)]
+    device_name: String,
+    /// The fields the panel just set; each replaces the stored one, `null`
+    /// removes it.
+    snapshot: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceStatesReply {
+    reassert_interval_seconds: u64,
+    verify_interval_seconds: u64,
+    states: Vec<crate::service::DeviceStateStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CapturePayload {
+    device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ColourPayload {
+    device_id: String,
+    color: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DevicesQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PowerPayload {
+    event: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeSettingsPayload {
     brand: String,
     dpi: Option<u32>,
@@ -93,6 +137,19 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
             "/v1/default-profile",
             get(default_profile).put(set_default_profile),
         )
+        .route("/v1/device-state", get(device_states).put(set_device_state))
+        .route("/v1/device-state/{device_id}", delete(forget_device_state))
+        .route("/v1/reassert", put(reassert_now))
+        .route("/v1/capture", put(capture_device_state))
+        .route("/", get(lighting_page))
+        .route("/lighting", get(lighting_page))
+        .route("/v1/lighting/devices", get(lighting_devices))
+        .route("/v1/lighting/colour", put(set_lighting_colour))
+        .route(
+            "/v1/lighting/settings",
+            get(lighting_settings).put(set_lighting_settings),
+        )
+        .route("/v1/lighting/power", put(simulate_power_event))
         .route("/v1/native/settings", put(apply_native_settings))
         .route("/v1/battery", put(record_battery))
         .route("/v1/battery/{device_id}", delete(forget_battery))
@@ -159,9 +216,13 @@ async fn request_gate(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // A page this service itself served (the lighting client) is same-origin: its
+    // Origin is the loopback host it was fetched from, which was checked above.
+    let same_origin = format!("http://{host}");
     if headers.contains_key(header::ORIGIN)
-        && !single_header(headers, header::ORIGIN)
-            .is_some_and(|origin| origin != "null" && allowed.contains(origin))
+        && !single_header(headers, header::ORIGIN).is_some_and(|origin| {
+            origin != "null" && (origin == same_origin || allowed.contains(origin))
+        })
     {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -375,6 +436,155 @@ async fn set_default_profile(
         .await
         .map_err(profile_error)?;
     Ok(Json(ApiResult { ok: true }))
+}
+
+async fn device_states(State(service): State<BridgeService>) -> Json<DeviceStatesReply> {
+    let config = service.config().await;
+    Json(DeviceStatesReply {
+        reassert_interval_seconds: config.reassert_interval_seconds,
+        verify_interval_seconds: config.verify_interval_seconds,
+        states: service.device_states().await,
+    })
+}
+
+async fn set_device_state(
+    State(service): State<BridgeService>,
+    payload: Result<Json<DeviceStatePayload>, JsonRejection>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    let Json(payload) = payload.map_err(invalid_json)?;
+    service
+        .merge_device_state(&payload.device_id, &payload.device_name, payload.snapshot)
+        .await
+        .map_err(profile_error)?;
+    Ok(Json(ApiResult { ok: true }))
+}
+
+async fn forget_device_state(
+    State(service): State<BridgeService>,
+    Path(device_id): Path<String>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    service
+        .forget_device_state(&device_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(ApiResult { ok: true }))
+}
+
+/// The lighting client: one self-contained page, served by the service itself so
+/// it needs no other app and works with or without vendor software.
+const LIGHTING_PAGE: &str = include_str!("ui/lighting.html");
+
+async fn lighting_page() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        LIGHTING_PAGE,
+    )
+}
+
+/// The connected devices that report lighting, and whether Synapse is running.
+async fn lighting_devices(
+    State(service): State<BridgeService>,
+    Query(query): Query<DevicesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let devices = service
+        .lighting_devices(query.refresh)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(serde_json::json!({
+        "devices": devices,
+        "razerSoftwareRunning": service.razer_software_running().await,
+    })))
+}
+
+/// Sets every zone of one device to a static colour, stores it, and writes it.
+async fn set_lighting_colour(
+    State(service): State<BridgeService>,
+    payload: Result<Json<ColourPayload>, JsonRejection>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    let Json(payload) = payload.map_err(invalid_json)?;
+    service
+        .set_lighting_colour(&payload.device_id, &payload.color)
+        .await
+        .map_err(profile_error)?;
+    Ok(Json(ApiResult { ok: true }))
+}
+
+async fn lighting_settings(State(service): State<BridgeService>) -> Json<serde_json::Value> {
+    let settings = service.lighting_settings().await;
+    Json(serde_json::json!({
+        "mode": settings.mode,
+        "offWhenDisplayOff": settings.off_when_display_off,
+        "offOnSleep": settings.off_on_sleep,
+        "razerSoftwareRunning": service.razer_software_running().await,
+    }))
+}
+
+async fn set_lighting_settings(
+    State(service): State<BridgeService>,
+    payload: Result<Json<crate::config::LightingSettings>, JsonRejection>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    let Json(settings) = payload.map_err(invalid_json)?;
+    service
+        .set_lighting_settings(settings)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(ApiResult { ok: true }))
+}
+
+/// Acts as though Windows had reported a power event, so the monitor-off and
+/// sleep options can be tried without waiting for the real thing. `displayOff`
+/// and `suspend` turn the lights off (when the matching option is on);
+/// `displayOn` and `resume` bring them back.
+async fn simulate_power_event(
+    State(service): State<BridgeService>,
+    payload: Result<Json<PowerPayload>, JsonRejection>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    let Json(payload) = payload.map_err(invalid_json)?;
+    let trigger = match payload.event.as_str() {
+        "displayOff" => crate::service::Trigger::DisplayOff,
+        "displayOn" => crate::service::Trigger::DisplayOn,
+        "suspend" => crate::service::Trigger::Suspend,
+        "resume" => crate::service::Trigger::Resume,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown event \"{other}\"; use displayOff, displayOn, suspend or resume"),
+            ));
+        }
+    };
+    service.request_reassert(trigger);
+    Ok(Json(ApiResult { ok: true }))
+}
+
+/// Reads what the device is running right now (a colour just picked in vendor
+/// software, say) and stores it as the state to replay.
+async fn capture_device_state(
+    State(service): State<BridgeService>,
+    payload: Result<Json<CapturePayload>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Json(payload) = payload.map_err(invalid_json)?;
+    let zones = service
+        .capture_device_state(&payload.device_id)
+        .await
+        .map_err(profile_error)?;
+    Ok(Json(serde_json::json!({ "ok": true, "zones": zones })))
+}
+
+/// Replays the stored device state now, whether or not the device looks
+/// connected, and says how many devices were written.
+async fn reassert_now(State(service): State<BridgeService>) -> Json<serde_json::Value> {
+    let written = service
+        .replay_device_states(crate::service::Trigger::Manual)
+        .await;
+    Json(serde_json::json!({ "ok": true, "written": written }))
 }
 
 async fn record_battery(

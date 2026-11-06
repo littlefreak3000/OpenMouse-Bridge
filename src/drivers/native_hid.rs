@@ -33,6 +33,17 @@ const EXIT_NO_DRIVER: i32 = 3;
 #[derive(Serialize)]
 struct ApplyRequest<'a> {
     brand: &'a str,
+    /// The device name from the profile id (`<brand>:<name>`), so a brand with
+    /// several connected devices writes to the one the profile is for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<&'a str>,
+    /// Refuse any device but the one named, instead of falling back to a lone
+    /// answering device: replaying stored state must not write elsewhere.
+    #[serde(rename = "exactDevice", skip_serializing_if = "std::ops::Not::not")]
+    exact_device: bool,
+    /// The product id that answered last time; its interfaces are tried first.
+    #[serde(rename = "hintProductId", skip_serializing_if = "Option::is_none")]
+    hint_product_id: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dpi: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "pollingRateHz")]
@@ -102,41 +113,183 @@ fn coerce_dpi(value: Option<&serde_json::Value>) -> Option<u32> {
     }
 }
 
-/// Pushes a profile's DPI/polling rate to the mouse via the Node helper.
-/// Returns `Ok(true)` on a confirmed apply, `Ok(false)` when the helper has
-/// no driver for this brand (most devices are still driven by the OpenMouse
-/// web app over WebHID instead), and `Err` when a driver exists but the
-/// apply itself failed (including the helper or Node.js being unavailable).
-pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
-    let brand = profile.device.id.split(':').next().unwrap_or_default();
-    apply_settings_with_snapshot(
+/// What a caller knows about which device a request is for, beyond its name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ApplyHints {
+    /// The product id that answered last time; its interfaces are tried first.
+    pub product_id: Option<u16>,
+    /// Write to the named device or to none: never to a lone other device.
+    pub exact_device: bool,
+}
+
+/// Pushes a profile's DPI/polling rate and stored snapshot to the device via the
+/// Node helper. Returns `(true, _)` on a confirmed apply and `(false, _)` when
+/// the helper has no driver for this brand (most devices are still driven by the
+/// OpenMouse web app over WebHID instead); `Err` means a driver exists but the
+/// apply itself failed (including the helper or Node.js being unavailable). The
+/// second value is the product id that answered, when the helper reports one, so
+/// the caller can pass it back as a hint.
+pub fn apply_with_hints(
+    profile: &ApplicationProfile,
+    hints: ApplyHints,
+) -> Result<(bool, Option<u16>)> {
+    let (brand, device) = profile
+        .device
+        .id
+        .split_once(':')
+        .unwrap_or((profile.device.id.as_str(), ""));
+    let request = ApplyRequest {
         brand,
-        profile.settings.dpi,
-        profile.settings.polling_rate_hz,
-        profile.settings.snapshot.as_ref(),
-    )
+        device: Some(device.trim()).filter(|name| !name.is_empty()),
+        exact_device: hints.exact_device,
+        hint_product_id: hints.product_id,
+        dpi: profile.settings.dpi,
+        polling_rate_hz: profile.settings.polling_rate_hz,
+        settings: profile.settings.snapshot.as_ref(),
+    };
+    Ok(match run_helper(&request)? {
+        Some(stdout) => (true, answered_product_id(&stdout)),
+        None => (false, None),
+    })
+}
+
+/// The `productId` the helper prints after a successful apply, if any.
+fn answered_product_id(stdout: &[u8]) -> Option<u16> {
+    serde_json::from_slice::<serde_json::Value>(stdout)
+        .ok()?
+        .get("productId")?
+        .as_u64()
+        .and_then(|id| u16::try_from(id).ok())
 }
 
 /// Pushes an explicit settings request from the local HTTP API. This shares
 /// the exact helper path used by automatic profiles, so native device control
 /// and profile switching cannot drift into separate protocol implementations.
 pub fn apply_settings(brand: &str, dpi: Option<u32>, polling_rate_hz: Option<u32>) -> Result<bool> {
-    apply_settings_with_snapshot(brand, dpi, polling_rate_hz, None)
+    apply_settings_with_snapshot(brand, None, dpi, polling_rate_hz, None)
 }
 
 fn apply_settings_with_snapshot(
     brand: &str,
+    device: Option<&str>,
     dpi: Option<u32>,
     polling_rate_hz: Option<u32>,
     settings: Option<&serde_json::Value>,
 ) -> Result<bool> {
     let request = ApplyRequest {
         brand,
+        device,
+        exact_device: false,
+        hint_product_id: None,
         dpi,
         polling_rate_hz,
         settings,
     };
     Ok(run_helper(&request)?.is_some())
+}
+
+#[derive(Serialize)]
+struct ListLightingRequest<'a> {
+    brand: &'a str,
+    action: &'static str,
+}
+
+/// Every connected device of `brand` that answers its driver, with the lighting
+/// zones it reports (`productId`, `name`, `firmware`, `zones`). Nothing is
+/// written.
+pub fn list_lighting(brand: &str) -> Result<Vec<serde_json::Value>> {
+    let request = ListLightingRequest {
+        brand,
+        action: "list-lighting",
+    };
+    let stdout = run_helper(&request)?
+        .with_context(|| format!("no native driver is registered for {brand}"))?;
+    let reply: serde_json::Value = serde_json::from_slice(&stdout)
+        .context("the native-hid helper returned an unreadable device list")?;
+    Ok(reply
+        .get("devices")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+#[derive(Serialize)]
+struct ReadLightingRequest<'a> {
+    brand: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<&'a str>,
+    #[serde(rename = "exactDevice")]
+    exact_device: bool,
+    #[serde(rename = "hintProductId", skip_serializing_if = "Option::is_none")]
+    hint_product_id: Option<u16>,
+    action: &'static str,
+}
+
+/// What the device named by `device_id` (`<brand>:<name>`) is running right now,
+/// as its driver reads it from the hardware: the lighting zones with an effect
+/// chosen, and the product id that answered. Nothing is written. A zone the
+/// driver can only cache (a model that cannot read its effect back) is left out,
+/// so an empty list means "this device did not report any", not "it is dark".
+pub fn read_lighting(
+    device_id: &str,
+    hint_product_id: Option<u16>,
+) -> Result<(Vec<serde_json::Value>, Option<u16>)> {
+    let (brand, device) = device_id.split_once(':').unwrap_or((device_id, ""));
+    let request = ReadLightingRequest {
+        brand,
+        device: Some(device.trim()).filter(|name| !name.is_empty()),
+        exact_device: true,
+        hint_product_id,
+        action: "read-lighting",
+    };
+    let stdout = run_helper(&request)?
+        .with_context(|| format!("no native driver is registered for {brand}"))?;
+    let reply: serde_json::Value = serde_json::from_slice(&stdout)
+        .context("the native-hid helper returned an unreadable lighting report")?;
+    let zones = reply
+        .get("lightingZones")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok((zones, answered_product_id(&stdout)))
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    #[test]
+    fn the_answered_product_id_is_read_from_the_helpers_output() {
+        assert_eq!(answered_product_id(br#"{"productId":123}"#), Some(123));
+        assert_eq!(answered_product_id(br#"{"productId":null}"#), None);
+        assert_eq!(answered_product_id(b""), None);
+        assert_eq!(
+            answered_product_id(br#"{"productId":70000}"#),
+            None,
+            "not a u16"
+        );
+    }
+
+    #[test]
+    fn hints_reach_the_helper_only_when_set() {
+        let request = |exact_device, hint_product_id| {
+            serde_json::to_value(ApplyRequest {
+                brand: "Razer",
+                device: Some("Mouse"),
+                exact_device,
+                hint_product_id,
+                dpi: None,
+                polling_rate_hz: None,
+                settings: None,
+            })
+            .unwrap()
+        };
+        let plain = request(false, None);
+        assert!(plain.get("exactDevice").is_none() && plain.get("hintProductId").is_none());
+        let hinted = request(true, Some(123));
+        assert_eq!(hinted["exactDevice"], true);
+        assert_eq!(hinted["hintProductId"], 123);
+    }
 }
 
 /// Reads a `brand` mouse's status via the Node helper. `Ok(None)` means
