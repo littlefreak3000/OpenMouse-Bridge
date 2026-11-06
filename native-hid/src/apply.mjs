@@ -42,6 +42,9 @@ import { applyX11PollingRate, x11DeviceInfos } from "./attack-shark-x11.mjs";
 import { candidateDevices, probeVerifiedDevice } from "./hid-device-adapter.mjs";
 import { devices } from "node-hid";
 import { automate } from "./automation.mjs";
+import { applySnapshotSettings, capturedLightingZones } from "./snapshot.mjs";
+import { selectDevice } from "./select-device.mjs";
+import { listLighting } from "./list-lighting.mjs";
 
 const EXIT_APPLIED = 0;
 const EXIT_FAILED = 1;
@@ -102,6 +105,14 @@ async function main() {
     process.exit(EXIT_NO_DRIVER);
   }
 
+  // Every connected device of the brand with the lighting zones it reports, so a
+  // client can offer them; nothing is written.
+  if (input.action === "list-lighting") {
+    const devices = await listLighting(entry, { candidates: candidateDevices, probe: (device, candidate) => probe(device, candidate) });
+    process.stdout.write(JSON.stringify({ devices }));
+    process.exit(EXIT_APPLIED);
+  }
+
   // The Attack Shark X11 family's settings channel is not visible through
   // WebHID, but it is reachable over native HID. Polling-only requests take
   // the verified direct feature-report path below; anything involving DPI
@@ -115,27 +126,37 @@ async function main() {
     }
   }
 
-  const attempts = [];
+  // `device` names the one to write to when a brand has several (a Razer mat
+  // answers beside a Razer mouse); without it the first device that answers wins.
+  const wantedName = typeof input.device === "string" ? input.device.trim() : "";
   let client = null;
   let status = null;
-  outer: for (const vendorId of entry.vendorIds) {
-    for (const device of candidateDevices(vendorId)) {
-      for (const candidate of entry.classes) {
-        try {
-          ({ client, status } = await probe(device, candidate));
-          break outer;
-        } catch (error) {
-          attempts.push(`${candidate.exportName} on ${device.productName || "unknown device"}: ${error.message}`);
-        }
-      }
-    }
+  let answeredProductId = null;
+  try {
+    ({ client, status, productId: answeredProductId } = await selectDevice(
+      entry,
+      wantedName,
+      {
+        candidates: candidateDevices,
+        probe: async (device, candidate) => ({ ...(await probe(device, candidate)), productId: device.productId }),
+      },
+      {
+        // Replaying stored state must not fall back to some other device.
+        exact: input.exactDevice === true,
+        hintProductId: Number.isInteger(input.hintProductId) ? input.hintProductId : undefined,
+      },
+    ));
+  } catch (error) {
+    console.error(`[native-hid] no ${brand} device answered: ${error.message}`);
+    process.exit(EXIT_FAILED);
   }
 
-  if (!client) {
-    console.error(
-      `[native-hid] no ${brand} device answered.` + (attempts.length ? ` Tried:\n  ${attempts.join("\n  ")}` : " No matching HID interface was found."),
-    );
-    process.exit(EXIT_FAILED);
+  // What the device is running right now, as the driver read it from the
+  // hardware; nothing is written.
+  if (input.action === "read-lighting") {
+    process.stdout.write(JSON.stringify({ productId: answeredProductId, lightingZones: capturedLightingZones(status) }));
+    await client.close().catch(() => undefined);
+    process.exit(EXIT_APPLIED);
   }
 
   if (input.action === "status") {
@@ -226,38 +247,26 @@ async function main() {
   // Only fields with a feature-detected driver method are applied; the
   // rest are reported and skipped.
   if (input.settings && typeof input.settings === "object" && !Array.isArray(input.settings)) {
-    const settings = input.settings;
-    const skipped = [];
-    if (
-      typeof settings.lightforceSwitchMode === "string" &&
-      typeof client.setLightforceSwitchMode === "function"
-    ) {
-      try {
-        await withTimeout(
-          client.setLightforceSwitchMode(settings.lightforceSwitchMode),
-          PROBE_TIMEOUT_MS,
-          "setLightforceSwitchMode",
-        );
-      } catch (error) {
-        console.error(`[native-hid] could not apply lightforceSwitchMode: ${error.message}`);
-        await client.close().catch(() => undefined);
-        process.exit(EXIT_FAILED);
+    let outcome;
+    try {
+      outcome = await applySnapshotSettings(client, input.settings, (promise, label) =>
+        withTimeout(promise, PROBE_TIMEOUT_MS, label));
+    } catch (error) {
+      console.error(`[native-hid] could not apply settings: ${error.message}`);
+      if (error.skipped?.length > 0) {
+        console.error(`[native-hid] no native support for: ${error.skipped.join(", ")} — skipped.`);
       }
-    } else if (typeof settings.lightforceSwitchMode === "string") {
-      skipped.push("lightforceSwitchMode");
+      await client.close().catch(() => undefined);
+      process.exit(EXIT_FAILED);
     }
-    const known = ["lightforceSwitchMode"];
-    for (const field of Object.keys(settings)) {
-      if (!known.includes(field) && settings[field] !== null && settings[field] !== undefined) {
-        skipped.push(field);
-      }
-    }
-    if (skipped.length > 0) {
-      console.error(`[native-hid] no native support for: ${skipped.join(", ")} — skipped.`);
+    if (outcome.skipped.length > 0) {
+      console.error(`[native-hid] no native support for: ${outcome.skipped.join(", ")} — skipped.`);
     }
   }
 
   await client.close().catch(() => undefined);
+  // Which product answered, so Bridge can try it first next time.
+  process.stdout.write(JSON.stringify({ productId: answeredProductId }));
   process.exit(EXIT_APPLIED);
 }
 
