@@ -5,6 +5,29 @@ edition = "2024"
 description = "Local native HID and desktop companion for the OpenMouse control panel"
 license = "MIT"
 
+[features]
+# The tray panel, overlay and everything that needs a window. The Windows
+# service (`openmouse-bridge-service`) builds without it:
+#   cargo build --release --no-default-features --bin openmouse-bridge-service
+default = ["gui"]
+gui = [
+  "dep:gpui-kit",
+  "dep:epaint_default_fonts",
+  "dep:skrifa",
+  "dep:vello_cpu",
+  "dep:tray-icon",
+  "dep:raw-window-handle",
+]
+
+[[bin]]
+name = "openmouse-bridge"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "openmouse-bridge-service"
+path = "src/bin/openmouse-bridge-service.rs"
+
 [build-dependencies]
 winresource = "0.1"
 
@@ -32,19 +55,19 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 # The window is GPUI; see docs/gpui-migration.md.
-gpui-kit = "0.7"
+gpui-kit = { version = "0.7", optional = true }
 # The profile-switch overlay draws its banner on the CPU: skrifa outlines, the
 # vello_cpu rasterizer, and epaint_default_fonts for fallback glyphs.
-epaint_default_fonts = "0.36.1"
-skrifa = { version = "0.44", default-features = false, features = ["std"] }
-vello_cpu = { version = "0.1", default-features = false, features = ["std", "u8_pipeline"] }
+epaint_default_fonts = { version = "0.36.1", optional = true }
+skrifa = { version = "0.44", default-features = false, features = ["std"], optional = true }
+vello_cpu = { version = "0.1", default-features = false, features = ["std", "u8_pipeline"], optional = true }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 # No default features: they link libxdo (via muda) for menu items Bridge never
 # uses. Linux has no tray yet, so this is not built there.
-tray-icon = { version = "0.24.2", default-features = false }
+tray-icon = { version = "0.24.2", default-features = false, optional = true }
 # The native window behind a GPUI window, to hide just the panel to the tray.
-raw-window-handle = "0.6"
+raw-window-handle = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # X11 overlay banner and foreground-window lookup. Pure Rust, no system
@@ -80,6 +103,9 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes", "CGRemoteOperation"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# The Windows service wrapper: runs the Bridge core at boot, with or without a
+# signed-in user, and hears session lock/unlock and resume from the SCM.
+windows-service = "0.8"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
@@ -88,6 +114,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_LibraryLoader",
   "Win32_Storage_FileSystem",
   "Win32_System_Registry",
+  "Win32_System_Power",
   "Win32_System_Threading",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
