@@ -252,14 +252,21 @@ export class HidDeviceAdapter {
  * @param {number} vendorId
  * @returns {HidDeviceAdapter[]}
  */
-export function candidateDevices(vendorId) {
+export function candidateDevices(vendorId, { platform = process.platform, list = devices } = {}) {
   const groups = new Map();
-  for (const info of devices()) {
+  for (const info of list()) {
     if (info.vendorId !== vendorId) continue;
-    // Skip keyboard collections (macOS denies IOHIDDeviceOpen with privilege violation 0xE00002C1)
-    if (info.usagePage === 1 && info.usage === 6) continue;
-    // Skip standard boot mouse collections (exclusive system cursor access 0xE00002C5, no vendor feature reports)
-    if (info.usagePage === 1 && (info.usage === 1 || info.usage === 2)) continue;
+    // Only macOS refuses these. Elsewhere they can carry the vendor's control
+    // channel: on Windows every Razer device here declares its 90-byte feature
+    // report on the mouse collection (keyboard collection for none, interface 2
+    // mouse collection for the BlackWidow), so skipping them hides the one
+    // interface that answers.
+    if (platform === "darwin") {
+      // Skip keyboard collections (macOS denies IOHIDDeviceOpen with privilege violation 0xE00002C1)
+      if (info.usagePage === 1 && info.usage === 6) continue;
+      // Skip standard boot mouse collections (exclusive system cursor access 0xE00002C5, no vendor feature reports)
+      if (info.usagePage === 1 && (info.usage === 1 || info.usage === 2)) continue;
+    }
     const key = `${info.productId}:${info.interface}`;
     const group = groups.get(key);
     if (group) group.push(info);
